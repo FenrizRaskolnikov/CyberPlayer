@@ -1,6 +1,6 @@
 # CyberPlayer
 
-¡Bienvenido a **CyberPlayer**! Un reproductor de música de escritorio nativo para Windows desarrollado en **C# y WPF**, diseñado con una estética Cyberpunk neón (fucsia y verde neón) y optimizado para ofrecer una reproducción fluida y sin fricciones.
+¡Bienvenido a **CyberPlayer**! Un reproductor de música de escritorio nativo para Windows desarrollado en **C# y WPF**, diseñado con una estética Cybergoth neón (fucsia y verde neón) y optimizado para ofrecer una reproducción fluida y sin fricciones.
 
 ---
 
