@@ -6,7 +6,7 @@
 
 ## Características Principales
 
-*   **Interfaz Cyberpunk Estilizada:** Un diseño oscuro, y de alto contraste utilizando estilos avanzados en XAML.
+*   **Interfaz Cybergoth Estilizada:** Un diseño oscuro, y de alto contraste utilizando estilos avanzados en XAML.
 *   **Reproducción Ininterrumpida (Seamless Audio):** Gracias a una arquitectura basada en la duplicación temporal de archivos de audio, puedes escuchar tus pistas favoritas de fondo de manera continua.
 *   **Control de Audio de Alta Precisión:** Motor multimedia potenciado por **NAudio** con monitor de volumen en tiempo real (Volume Meter), slider de progreso interactivo y control de volumen integrado.
 *   **Gestión de Cola de Reproducción:** Cola inteligente integrada que sincroniza el índice visual de la lista con las canciones reales en cola.
