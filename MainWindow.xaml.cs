@@ -1,6 +1,7 @@
 ﻿using NAudio.Dsp;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
+using System.Collections.ObjectModel;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -24,15 +25,18 @@ namespace CyberPlayer
         private WaveOutEvent outputDevice;
 
         // El lector del archivo de audio (el que decodifica el archivo MP3)
-        // El lector del archivo de audio (el que decodifica el archivo MP3)
         private AudioFileReader audioFile;
 
-        // NUEVO: Lista oculta en memoria para guardar las rutas reales de los archivos
+        // Variable global en MainWindow
+        private System.IO.FileSystemWatcher monitorCarpetas;
+
+        //Lista oculta en memoria para guardar las rutas reales de los archivos
         private List<string> rutasArchivosReales = new List<string>();
-        // Variable para almacenar de forma persistente la cola de reproducción actual
-        private List<string> colaDeReproduccion = new List<string>();
+        
+        private System.Collections.ObjectModel.ObservableCollection<string> colaDeReproduccion = new System.Collections.ObjectModel.ObservableCollection<string>();
         // El índice real de la canción que está sonando dentro de la cola en memoria
         private int indiceEnColaActual = -1;
+        private bool editandoMetadatosActivo = false;
         // Guardan la altura actual de los picos flotantes (0 a 60 que es el alto del visualizador)
         private double[] picosAlturas = new double[8];
         // Controlan la velocidad de caída de cada pico para simular gravedad
@@ -95,53 +99,68 @@ namespace CyberPlayer
             ActualizarVisibilidadVolver();
         }
 
-        // Cambia la lista verde para mostrar los nombres de los artistas
         private void BtnVistaArtistas_Click(object sender, RoutedEventArgs e)
         {
-            
             vistaActual = 1; // 1 = Artistas
             ActualizarColoresPestañas(BtnVistaArtistas);
 
+            // OJO: Ya NO tocamos 'colaDeReproduccion' aquí para no romper la música actual.
+            // Solo limpiamos la vista visual de la pantalla.
+            ListaCanciones.ItemsSource = null;
             ListaCanciones.Items.Clear();
-            rutasArchivosReales.Clear(); // En esta vista no hay rutas físicas directas
+            rutasArchivosReales.Clear();
 
+            // Creamos una lista auxiliar solo para mostrar los artistas en la interfaz
+            var listaArtistasVisual = new ObservableCollection<string>();
             foreach (var artista in biblioteca.Artistas)
             {
-                ListaCanciones.Items.Add($"[ARTISTA] > {artista.Nombre}");
+                listaArtistasVisual.Add($"[ARTISTA] > {artista.Nombre}");
             }
+
+            ListaCanciones.ItemsSource = listaArtistasVisual;
             ActualizarVisibilidadVolver();
         }
 
-        // Cambia la lista verde para mostrar todos los álbumes
         private void BtnVistaAlbumes_Click(object sender, RoutedEventArgs e)
         {
             artistaFiltradoActual = null;
             vistaActual = 2; // 2 = Álbumes
             ActualizarColoresPestañas(BtnVistaAlbumes);
 
+            // Tampoco tocamos 'colaDeReproduccion' aquí.
+            ListaCanciones.ItemsSource = null;
             ListaCanciones.Items.Clear();
             rutasArchivosReales.Clear();
 
+            var listaAlbumesVisual = new ObservableCollection<string>();
             foreach (var album in biblioteca.TodosLosAlbumes)
             {
-                ListaCanciones.Items.Add($"[ÁLBUM] > {album.Nombre} ({album.Artista})");
+                listaAlbumesVisual.Add($"[ÁLBUM] > {album.Nombre} ({album.Artista})");
             }
+
+            ListaCanciones.ItemsSource = listaAlbumesVisual;
             ActualizarVisibilidadVolver();
         }
-        // Función para rellenar la lista con todo el catálogo disponible
+
         private void MostrarTodasLasCanciones()
         {
+            ListaCanciones.ItemsSource = null;
             ListaCanciones.Items.Clear();
+
             rutasArchivosReales.Clear();
+
+            // Aquí sí cargamos la lista visual de todas las canciones en pantalla
+            var listaTodasVisual = new ObservableCollection<string>();
 
             foreach (var cancion in biblioteca.TodasLasCanciones)
             {
                 rutasArchivosReales.Add(cancion.RutaCompleta);
-                ListaCanciones.Items.Add($"{cancion.Artista} - {cancion.Album} > {cancion.Titulo}");
+                listaTodasVisual.Add($"{cancion.Artista} - {cancion.Album} > {cancion.Titulo}");
             }
+
+            ListaCanciones.ItemsSource = listaTodasVisual;
         }
 
-        // Hace que la pestaña seleccionada brille en verde neón y las demás queden atenuadas en blanco
         private void ActualizarColoresPestañas(Button pestañaActiva)
         {
             BtnVistaTodas.Foreground = Brushes.White;
@@ -163,6 +182,9 @@ namespace CyberPlayer
         private int estadoRepeticion = 0;
         private int vistaActual = 0;
         private bool fueDetenidoManualmente = false;
+        // Memoria para recordar qué canciones sonaron en modo Aleatorio
+        private Stack<int> historialAtras = new Stack<int>();
+        private Stack<int> historialAdelante = new Stack<int>();
 
         // Para el modo aleatorio: guarda el historial de lo que ya sonó para no repetir
         private Random random = new Random();
@@ -182,138 +204,51 @@ namespace CyberPlayer
         // 1. FUNCIÓN MAESTRA: Se encarga de apagar el motor viejo y cargar el archivo nuevo
         private void ReproducirCancionSeleccionada()
         {
-            if (ListaCanciones.SelectedIndex >= 0)
+            // 🛡️ ESCUDO MAESTRO
+            if (ListaCanciones.SelectedIndex < 0 || ListaCanciones.SelectedIndex >= rutasArchivosReales.Count)
+                return;
+
+            int indiceSeleccionado = ListaCanciones.SelectedIndex;
+
+            // 1. Obtenemos la ruta que el usuario acaba de cliquear
+            string rutaArchivoOriginal = rutasArchivosReales[indiceSeleccionado];
+
+            // 2. VALIDACIÓN FÍSICA SILENCIOSA
+            // Si hiciste doble clic en una carpeta visual como [ARTISTA] o [ALBUM], esto fallará.
+            if (string.IsNullOrEmpty(rutaArchivoOriginal) || !System.IO.File.Exists(rutaArchivoOriginal))
             {
-                int indiceSeleccionado = ListaCanciones.SelectedIndex;
-                if (indiceSeleccionado >= rutasArchivosReales.Count) return;
-
-                // --- SISTEMA DE ACOPLAMIENTO DE COLA INTELIGENTE ---
-                // Si el usuario hace doble clic en una pista, "congelamos" la vista actual como nuestra cola de reproducción
-                if (colaDeReproduccion.Count == 0 || !ListasSonIdenticas(rutasArchivosReales, colaDeReproduccion) || indiceCancionActual != indiceSeleccionado)
-                {
-                    colaDeReproduccion = new List<string>(rutasArchivosReales);
-                    indiceEnColaActual = indiceSeleccionado;
-                }
-
-                string rutaArchivo = colaDeReproduccion[indiceEnColaActual];
-
-                try
-                {
-                    // ===================================================================
-                    // 🛠️ EXTRAER METADATOS Y CARÁTULA
-                    // ===================================================================
-                    try
-                    {
-                        using (var tagFile = TagLib.File.Create(rutaArchivo))
-                        {
-                            string titulo = !string.IsNullOrEmpty(tagFile.Tag.Title)
-                                ? tagFile.Tag.Title
-                                : System.IO.Path.GetFileNameWithoutExtension(rutaArchivo);
-
-                            string artista = (tagFile.Tag.Performers != null && tagFile.Tag.Performers.Length > 0)
-                                ? tagFile.Tag.Performers[0]
-                                : "Artista Desconocido";
-
-                            TxtTituloActual.Text = titulo.ToUpper();
-                            TxtArtistaActual.Text = artista.ToUpper();
-
-                            if (tagFile.Tag.Pictures != null && tagFile.Tag.Pictures.Length > 0)
-                            {
-                                var pic = tagFile.Tag.Pictures[0];
-                                byte[] bytesImagen = pic.Data.Data;
-
-                                using (var ms = new System.IO.MemoryStream(bytesImagen))
-                                {
-                                    var bitmap = new BitmapImage();
-                                    bitmap.BeginInit();
-                                    bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
-                                    bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                                    bitmap.StreamSource = ms;
-                                    bitmap.EndInit();
-                                    bitmap.Freeze();
-
-                                    ImgCaratula.Source = bitmap;
-                                }
-                            }
-                            else
-                            {
-                                ImgCaratula.Source = null;
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        TxtTituloActual.Text = System.IO.Path.GetFileNameWithoutExtension(rutaArchivo).ToUpper();
-                        TxtArtistaActual.Text = "ARTISTA DESCONOCIDO";
-                        ImgCaratula.Source = null;
-                    }
-                    // ===================================================================
-
-                    // --- Lógica de NAudio para limpiar hilos ---
-                    if (outputDevice != null)
-                    {
-                        outputDevice.PlaybackStopped -= OutputDevice_PlaybackStopped;
-                        outputDevice.Stop();
-                        outputDevice.Dispose();
-                        outputDevice = null;
-                    }
-                    if (audioFile != null)
-                    {
-                        audioFile.Dispose();
-                        audioFile = null;
-                    }
-
-                    audioFile = new AudioFileReader(rutaArchivo);
-
-                    canalMuestras = new SampleChannel(audioFile);
-                    canalMuestras.PreVolumeMeter += CanalMuestras_PreVolumeMeter;
-
-                    outputDevice = new WaveOutEvent();
-                    outputDevice.PlaybackStopped += OutputDevice_PlaybackStopped;
-
-                    audioFile.Volume = (float)SliderVolumen.Value;
-
-                    outputDevice.Init(canalMuestras);
-                    outputDevice.Play();
-
-                    // Sincronizamos las variables del motor
-                    indiceCancionActual = indiceSeleccionado;
-
-                    // Si visualmente la pantalla muestra la misma lista de la que estamos reproduciendo, sincronizamos el foco visual
-                    if (ListasSonIdenticas(rutasArchivosReales, colaDeReproduccion))
-                    {
-                        ListaCanciones.SelectedIndex = indiceEnColaActual;
-                    }
-
-                    SliderProgreso.Maximum = audioFile.TotalTime.TotalSeconds;
-                    SliderProgreso.Value = 0;
-                    TxtTiempoTotal.Text = audioFile.TotalTime.ToString(@"mm\:ss");
-                    TxtTiempoActual.Text = "00:00";
-
-                    relojTiempo.Start();
-                    ActualizarBotonPlayPause(true);
-                }
-                catch (System.Exception ex)
-                {
-                    System.Windows.MessageBox.Show("Error al reproducir el archivo: " + ex.Message);
-                }
+                // Hacemos "return" en silencio. 
+                // App seguirá abriendo la carpeta en pantalla, pero la cola de audio
+                // no se corrompe y la música de fondo sigue intacta.
+                return;
             }
-        }
-        private string archivoTemporalActivo = null;
-        private void ReproducirCancionDesdeCola()
-        {
-            if (indiceEnColaActual < 0 || indiceEnColaActual >= colaDeReproduccion.Count) return;
-            string rutaArchivoOriginal = colaDeReproduccion[indiceEnColaActual];
+
+            // 3. SINCRONIZACIÓN BLINDADA
+            // Solo si pasó la prueba y es una CANCIÓN REAL, actualizamos la memoria del reproductor.
+            colaDeReproduccion = new System.Collections.ObjectModel.ObservableCollection<string>(rutasArchivosReales);
+
+            // Limpiamos la línea temporal porque el usuario forzó una canción a mano
+            historialAtras.Clear();
+            historialAdelante.Clear();
+
+            // Actualizamos los índices del motor
+            indiceEnColaActual = indiceSeleccionado;
+            indiceCancionActual = indiceSeleccionado;
 
             try
             {
-                // 1. Extraer metadatos
+                // EXTRAER METADATOS Y CARÁTULA (Sin bloqueos)
                 try
                 {
                     using (var tagFile = TagLib.File.Create(rutaArchivoOriginal))
                     {
-                        string titulo = !string.IsNullOrEmpty(tagFile.Tag.Title) ? tagFile.Tag.Title : System.IO.Path.GetFileNameWithoutExtension(rutaArchivoOriginal);
-                        string artista = (tagFile.Tag.Performers != null && tagFile.Tag.Performers.Length > 0) ? tagFile.Tag.Performers[0] : "Artista Desconocido";
+                        string titulo = !string.IsNullOrEmpty(tagFile.Tag.Title)
+                            ? tagFile.Tag.Title
+                            : System.IO.Path.GetFileNameWithoutExtension(rutaArchivoOriginal);
+
+                        string artista = (tagFile.Tag.Performers != null && tagFile.Tag.Performers.Length > 0)
+                            ? tagFile.Tag.Performers[0]
+                            : "Artista Desconocido";
 
                         TxtTituloActual.Text = titulo.ToUpper();
                         TxtArtistaActual.Text = artista.ToUpper();
@@ -323,20 +258,23 @@ namespace CyberPlayer
                             var pic = tagFile.Tag.Pictures[0];
                             byte[] bytesImagen = pic.Data.Data;
 
-                            // CORRECCIÓN AQUÍ: Forzar la carga en RAM para no bloquear el MP3 original
                             using (var ms = new System.IO.MemoryStream(bytesImagen))
                             {
                                 var bitmap = new BitmapImage();
                                 bitmap.BeginInit();
                                 bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
-                                bitmap.CacheOption = BitmapCacheOption.OnLoad; // <-- CRÍTICO
+                                bitmap.CacheOption = BitmapCacheOption.OnLoad;
                                 bitmap.StreamSource = ms;
                                 bitmap.EndInit();
-                                bitmap.Freeze(); // <-- CRÍTICO
+                                bitmap.Freeze();
+
                                 ImgCaratula.Source = bitmap;
                             }
                         }
-                        else { ImgCaratula.Source = null; }
+                        else
+                        {
+                            ImgCaratula.Source = null;
+                        }
                     }
                 }
                 catch
@@ -346,7 +284,7 @@ namespace CyberPlayer
                     ImgCaratula.Source = null;
                 }
 
-                // 2. Apagar motor viejo de forma limpia antes de liberar recursos
+                // --- Lógica de NAudio para limpiar hilos ---
                 if (outputDevice != null)
                 {
                     outputDevice.PlaybackStopped -= OutputDevice_PlaybackStopped;
@@ -360,10 +298,8 @@ namespace CyberPlayer
                     audioFile = null;
                 }
 
-                // 3. Limpiar el archivo temporal de la canción anterior si existía
                 EliminarArchivoTemporal();
 
-                // 4. Crear la copia temporal para que NAudio no bloquee el archivo original
                 try
                 {
                     string extension = System.IO.Path.GetExtension(rutaArchivoOriginal);
@@ -373,11 +309,157 @@ namespace CyberPlayer
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show("Error al preparar el archivo temporal: " + ex.Message);
+                    System.Windows.MessageBox.Show("Error al preparar el archivo temporal: " + ex.Message);
                     return;
                 }
 
-                // 5. Encender el nuevo track usando la COPIA TEMPORAL
+                // 🔥 NAudio ahora lee la COPIA TEMPORAL. El archivo original queda 100% libre.
+                audioFile = new AudioFileReader(archivoTemporalActivo);
+
+                canalMuestras = new SampleChannel(audioFile);
+                canalMuestras.PreVolumeMeter += CanalMuestras_PreVolumeMeter;
+
+                outputDevice = new WaveOutEvent();
+                outputDevice.PlaybackStopped += OutputDevice_PlaybackStopped;
+
+                audioFile.Volume = (float)SliderVolumen.Value;
+
+                outputDevice.Init(canalMuestras);
+                outputDevice.Play();
+
+                // Sincronizamos las variables del motor
+                indiceCancionActual = indiceSeleccionado;
+
+                // 🛡️ ESCUDO INTERFAZ: Sincronizamos la selección solo si el índice está en el rango actual de la grilla
+                if (ListasSonIdenticas(rutasArchivosReales, colaDeReproduccion.ToList()))
+                {
+                    if (indiceEnColaActual >= 0 && indiceEnColaActual < ListaCanciones.Items.Count)
+                    {
+                        ListaCanciones.SelectedIndex = indiceEnColaActual;
+                    }
+                }
+
+                SliderProgreso.Maximum = audioFile.TotalTime.TotalSeconds;
+                SliderProgreso.Value = 0;
+                TxtTiempoTotal.Text = audioFile.TotalTime.ToString(@"mm\:ss");
+                TxtTiempoActual.Text = "00:00";
+
+                relojTiempo.Start();
+                ActualizarBotonPlayPause(true);
+            }
+            catch (System.Exception ex)
+            {
+                System.Windows.MessageBox.Show("Error al reproducir el archivo: " + ex.Message);
+            }
+        }
+
+        private string archivoTemporalActivo = null;
+
+        private void ReproducirCancionDesdeCola()
+        {
+            // 1. ESCUDO DE SEGURIDAD: Validar rangos básicos de la cola interna
+            if (indiceEnColaActual < 0 || indiceEnColaActual >= colaDeReproduccion.Count) return;
+
+            string rutaArchivoOriginal = colaDeReproduccion[indiceEnColaActual];
+
+            // Si la ruta está vacía por una mala transición, salimos silenciosamente
+            if (string.IsNullOrEmpty(rutaArchivoOriginal)) return;
+
+            // 🔥 BLINDAJE DEFENSIVO: Si la cadena contiene caracteres visuales de la interfaz ('>') 
+            // o el archivo no existe físicamente, rescatamos la ruta real desde 'rutasArchivosReales' automáticamente.
+            if (rutaArchivoOriginal.Contains(">") || !System.IO.File.Exists(rutaArchivoOriginal))
+            {
+                if (rutasArchivosReales != null && indiceEnColaActual >= 0 && indiceEnColaActual < rutasArchivosReales.Count)
+                {
+                    rutaArchivoOriginal = rutasArchivosReales[indiceEnColaActual];
+                    colaDeReproduccion[indiceEnColaActual] = rutaArchivoOriginal; // Auto-repara la cola al vuelo para el próximo "Siguiente"
+                }
+            }
+
+            // 2. 🌟 VALIDACIÓN FÍSICA FINAL:
+            if (!System.IO.File.Exists(rutaArchivoOriginal))
+            {
+                System.Windows.MessageBox.Show("Ruta fallida: " + rutaArchivoOriginal);
+                return;
+            }
+
+            try
+            {
+                // 3. Extraer metadatos con TagLib (Sin bloquear el archivo)
+                try
+                {
+                    using (var tagFile = TagLib.File.Create(rutaArchivoOriginal))
+                    {
+                        string titulo = !string.IsNullOrEmpty(tagFile.Tag.Title)
+                            ? tagFile.Tag.Title
+                            : System.IO.Path.GetFileNameWithoutExtension(rutaArchivoOriginal);
+
+                        string artista = (tagFile.Tag.Performers != null && tagFile.Tag.Performers.Length > 0)
+                            ? tagFile.Tag.Performers[0]
+                            : "Artista Desconocido";
+
+                        TxtTituloActual.Text = titulo.ToUpper();
+                        TxtArtistaActual.Text = artista.ToUpper();
+
+                        if (tagFile.Tag.Pictures != null && tagFile.Tag.Pictures.Length > 0)
+                        {
+                            var pic = tagFile.Tag.Pictures[0];
+                            byte[] bytesImagen = pic.Data.Data;
+
+                            using (var ms = new System.IO.MemoryStream(bytesImagen))
+                            {
+                                var bitmap = new BitmapImage();
+                                bitmap.BeginInit();
+                                bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
+                                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                                bitmap.StreamSource = ms;
+                                bitmap.EndInit();
+                                bitmap.Freeze();
+                                ImgCaratula.Source = bitmap;
+                            }
+                        }
+                        else { ImgCaratula.Source = null; }
+                    }
+                }
+                catch
+                {
+                    TxtTituloActual.Text = System.IO.Path.GetFileNameWithoutExtension(rutaArchivoOriginal).ToUpper();
+                    TxtArtistaActual.Text = "ARTISTA DESCONOCIDO";
+                    ImgCaratula.Source = null;
+                }
+
+                // 4. Apagar motor viejo de forma limpia y liberar recursos por completo
+                if (outputDevice != null)
+                {
+                    outputDevice.PlaybackStopped -= OutputDevice_PlaybackStopped;
+                    outputDevice.Stop();
+                    outputDevice.Dispose();
+                    outputDevice = null;
+                }
+                if (audioFile != null)
+                {
+                    audioFile.Dispose();
+                    audioFile = null;
+                }
+
+                // 5. Limpiar el archivo temporal de la canción anterior
+                EliminarArchivoTemporal();
+
+                // 6. Crear la copia temporal en disco para que NAudio no bloquee el archivo
+                try
+                {
+                    string extension = System.IO.Path.GetExtension(rutaArchivoOriginal);
+                    archivoTemporalActivo = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"CyberPlayer_Temp_{Guid.NewGuid()}{extension}");
+
+                    System.IO.File.Copy(rutaArchivoOriginal, archivoTemporalActivo, true);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("Error al preparar archivo temporal en cola: " + ex.Message);
+                    return;
+                }
+
+                // 7. Encender el nuevo track usando la COPIA TEMPORAL
                 audioFile = new AudioFileReader(archivoTemporalActivo);
                 canalMuestras = new SampleChannel(audioFile);
                 canalMuestras.PreVolumeMeter += CanalMuestras_PreVolumeMeter;
@@ -389,15 +471,20 @@ namespace CyberPlayer
                 outputDevice.Init(canalMuestras);
                 outputDevice.Play();
 
-                // Si la interfaz de pantalla está mostrando la lista correspondiente a la cola, actualizamos la selección visual
-                if (ListasSonIdenticas(rutasArchivosReales, colaDeReproduccion))
+                // 8. 🔄 SINCRONIZACIÓN VISUAL SEGURA
+                if (rutasArchivosReales != null && rutasArchivosReales.Contains(rutaArchivoOriginal))
                 {
-                    indiceCancionActual = indiceEnColaActual;
-                    ListaCanciones.SelectedIndex = indiceEnColaActual;
+                    int indiceVisualCorrespondiente = rutasArchivosReales.IndexOf(rutaArchivoOriginal);
+                    indiceCancionActual = indiceVisualCorrespondiente;
+
+                    if (indiceVisualCorrespondiente >= 0 && indiceVisualCorrespondiente < ListaCanciones.Items.Count)
+                    {
+                        ListaCanciones.SelectedIndex = indiceVisualCorrespondiente;
+                        ListaCanciones.ScrollIntoView(ListaCanciones.Items[indiceVisualCorrespondiente]);
+                    }
                 }
                 else
                 {
-                    // Si el usuario está explorando otras vistas (ej. artistas), dejamos el índice visual en -1 para no confundir
                     indiceCancionActual = -1;
                 }
 
@@ -411,7 +498,7 @@ namespace CyberPlayer
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Error en la cola de reproducción: " + ex.Message);
+                System.Diagnostics.Debug.WriteLine("Error crítico en cola: " + ex.Message);
             }
         }
 
@@ -503,35 +590,43 @@ namespace CyberPlayer
 
             if (vistaActual == 0 || vistaActual == 4)
             {
-                // ➔ CASO 0 o 4: Son canciones reales, se reproducen.
-                ReproducirCancionSeleccionada();
+                // ➔ CASO 0 o 4: Canciones reales. Usamos el cargador inteligente que respeta el Shuffle activo.
+                if (rutasArchivosReales != null && seleccionado < rutasArchivosReales.Count)
+                {
+                    CargarYReproducerCola(rutasArchivosReales, seleccionado);
+                }
+                else
+                {
+                    ReproducirCancionSeleccionada();
+                }
             }
             else if (vistaActual == 1)
             {
-                // ➔ CASO 1: Estamos en la lista global de ARTISTAS. 
+                // ➔ CASO 1: Lista global de ARTISTAS. 
                 if (seleccionado < biblioteca.Artistas.Count)
                 {
                     artistaFiltradoActual = biblioteca.Artistas[seleccionado];
-                    vistaActual = 3; // Cambiamos a estado: Viendo álbumes de un artista
+                    vistaActual = 3;
 
+                    ListaCanciones.ItemsSource = null;
                     ListaCanciones.Items.Clear();
                     rutasArchivosReales.Clear();
 
                     foreach (var album in artistaFiltradoActual.Albumes)
                     {
-                        // Usamos album.Nombre porque así está en tu AlbumInfo
                         ListaCanciones.Items.Add($"[DISCO] > {album.Nombre}");
                     }
                 }
             }
             else if (vistaActual == 2)
             {
-                // ➔ CASO 2: Estamos en la lista global de ÁLBUMES.
+                // ➔ CASO 2: Lista global de ÁLBUMES.
                 if (seleccionado < biblioteca.TodosLosAlbumes.Count)
                 {
                     albumFiltradoActual = biblioteca.TodosLosAlbumes[seleccionado];
-                    vistaActual = 4; // Cambiamos a estado: Viendo canciones de un álbum
+                    vistaActual = 4;
 
+                    ListaCanciones.ItemsSource = null;
                     ListaCanciones.Items.Clear();
                     rutasArchivosReales.Clear();
 
@@ -544,12 +639,13 @@ namespace CyberPlayer
             }
             else if (vistaActual == 3)
             {
-                // ➔ CASO 3: Estábamos viendo los discos de un artista específico y elegimos uno.
+                // ➔ CASO 3: Discos de un artista específico.
                 if (seleccionado < artistaFiltradoActual.Albumes.Count)
                 {
                     albumFiltradoActual = artistaFiltradoActual.Albumes[seleccionado];
-                    vistaActual = 4; // Cambiamos a estado: Viendo canciones de un álbum
+                    vistaActual = 4;
 
+                    ListaCanciones.ItemsSource = null;
                     ListaCanciones.Items.Clear();
                     rutasArchivosReales.Clear();
 
@@ -570,31 +666,39 @@ namespace CyberPlayer
                 // 🔥 Indicamos que fuimos nosotros quienes paramos el motor
                 fueDetenidoManualmente = true;
 
+                // 🔥 DETENEMOS EL RELOJ PRIMERO para evitar que intente leer posiciones mientras destruimos el motor
+                relojTiempo.Stop();
+
+                // 🛠️ LIBERACIÓN TOTAL DEL MOTOR (Así el botón Play puede iniciar limpio de cero)
                 if (outputDevice != null)
                 {
+                    outputDevice.PlaybackStopped -= OutputDevice_PlaybackStopped; // Quitamos el evento
                     outputDevice.Stop();
+                    outputDevice.Dispose();
+                    outputDevice = null;
                 }
 
                 if (audioFile != null)
                 {
-                    audioFile.Position = 0;
+                    audioFile.Dispose();
+                    audioFile = null;
                 }
 
-                // 🔥 Detenemos el reloj y reseteamos el ecualizador visual
-                relojTiempo.Stop();
-                ResetearBarrasVisualizador();
+                // 🔥 Liberamos el archivo temporal que estaba sonando para no dejar basura en el disco
+                EliminarArchivoTemporal();
 
+                // Reseteamos el ecualizador visual y sliders
+                ResetearBarrasVisualizador();
                 SliderProgreso.Value = 0;
                 TxtTiempoActual.Text = "00:00";
                 ActualizarBotonPlayPause(false);
 
                 // ===================================================================
-                // 🛠️ NUEVO: LIMPIEZA DE METADATOS AL DETENER LA MÚSICA (Paso 3)
+                // 🛠️ LIMPIEZA DE METADATOS AL DETENER LA MÚSICA
                 // ===================================================================
                 TxtTituloActual.Text = "SISTEMA DETENIDO";
                 TxtArtistaActual.Text = "SELECCIONA UNA PISTA";
-                ImgCaratula.Source = null; // Quita la imagen actual de la pantalla
-                                           // ===================================================================
+                ImgCaratula.Source = null;
             }
             catch (Exception ex)
             {
@@ -645,9 +749,10 @@ namespace CyberPlayer
                     return; // Nos salimos sin hacer nada más
                 }
 
+                // 🔁 REPEAT ONE: Volvemos a reproducir la misma posición exacta de la cola de reproducción
                 if (estadoRepeticion == 1)
                 {
-                    ReproducirCancionSeleccionada();
+                    ReproducirCancionDesdeCola();
                     return;
                 }
 
@@ -658,35 +763,40 @@ namespace CyberPlayer
         // LÓGICA DE AVANCE (Siguiente pista)
         private void AvanzarSiguienteCancion(bool esAutomatico)
         {
-            if (colaDeReproduccion.Count == 0) return;
+            if (colaDeReproduccion == null || colaDeReproduccion.Count == 0) return;
 
-            if (modoAleatorio)
+            // NOTA: Como el modo aleatorio ya mezcló 'colaDeReproduccion' al activarse,
+            // avanzar en modo aleatorio o en modo normal es exactamente lo mismo: 
+            // pasar secuencialmente al siguiente índice de la cola.
+
+            if (indiceEnColaActual < colaDeReproduccion.Count - 1)
             {
-                indiceEnColaActual = random.Next(0, colaDeReproduccion.Count);
+                // Guardamos la posición actual en el historial de retroceso antes de avanzar
+                historialAtras.Push(indiceEnColaActual);
+                historialAdelante.Clear(); // Limpiamos el futuro al avanzar
+
+                indiceEnColaActual++;
                 ReproducirCancionDesdeCola();
             }
             else
             {
-                if (indiceEnColaActual < colaDeReproduccion.Count - 1)
+                // Hemos llegado a la última canción de la cola (ya sea en orden natural o en orden aleatorio)
+                if (estadoRepeticion == 2) // Repetir toda la lista
                 {
-                    indiceEnColaActual++;
+                    historialAtras.Push(indiceEnColaActual);
+                    historialAdelante.Clear();
+                    indiceEnColaActual = 0; // Regresa al inicio de la cola
                     ReproducirCancionDesdeCola();
                 }
                 else
                 {
-                    // Fin de la cola de reproducción actual
-                    if (estadoRepeticion == 2) // REPEAT ALL
-                    {
-                        indiceEnColaActual = 0;
-                        ReproducirCancionDesdeCola();
-                    }
-                    else if (esAutomatico)
-                    {
-                        // Fin normal sin bucle: Apagamos el reproductor de forma limpia
-                        if (outputDevice != null) outputDevice.Stop();
-                        ActualizarBotonPlayPause(false);
-                        ResetearBarrasVisualizador();
-                    }
+                    // Fin de la cola: la última canción ha terminado (o se presionó siguiente en la última)
+                    if (outputDevice != null) outputDevice.Stop();
+                    ActualizarBotonPlayPause(false);
+                    ResetearBarrasVisualizador();
+                    TxtTituloActual.Text = "FIN DE LA COLA";
+                    TxtArtistaActual.Text = "SELECCIONA OTRA PISTA";
+                    ImgCaratula.Source = null;
                 }
             }
         }
@@ -700,23 +810,41 @@ namespace CyberPlayer
         // BOTÓN ANTERIOR (Manual)
         private void BtnAnterior_Click(object sender, RoutedEventArgs e)
         {
-            if (colaDeReproduccion.Count == 0) return;
+            if (colaDeReproduccion == null || colaDeReproduccion.Count == 0) return;
 
             if (modoAleatorio)
             {
-                indiceEnColaActual = random.Next(0, colaDeReproduccion.Count);
+                if (historialAtras.Count > 0)
+                {
+                    // 🔥 Guardamos la canción actual en el "futuro" antes de retroceder
+                    historialAdelante.Push(indiceEnColaActual);
+
+                    // Ahora sí, volvemos a la canción anterior
+                    indiceEnColaActual = historialAtras.Pop();
+                }
+                else
+                {
+                    indiceEnColaActual = 0;
+                }
             }
             else
             {
+                // ... (Tu código original lineal sigue exactamente igual)
                 if (indiceEnColaActual > 0)
                 {
                     indiceEnColaActual--;
                 }
-                else if (estadoRepeticion == 2) // REPEAT ALL
+                else if (estadoRepeticion == 2)
                 {
                     indiceEnColaActual = colaDeReproduccion.Count - 1;
                 }
+                else
+                {
+                    indiceEnColaActual = 0;
+                }
             }
+
+            indiceCancionActual = indiceEnColaActual;
             ReproducirCancionDesdeCola();
         }
 
@@ -724,6 +852,7 @@ namespace CyberPlayer
         private void BtnAleatorio_Click(object sender, RoutedEventArgs e)
         {
             modoAleatorio = !modoAleatorio; // Cambia el switch
+
             var convertidor = new System.Windows.Media.ColorConverter();
 
             if (modoAleatorio)
@@ -731,13 +860,83 @@ namespace CyberPlayer
                 BtnAleatorio.Content = "🔀 SHUFFLE [ON]";
                 BtnAleatorio.Foreground = new SolidColorBrush((Color)convertidor.ConvertFrom("#00FF66")); // Verde Neón
                 BtnAleatorio.BorderBrush = new SolidColorBrush((Color)convertidor.ConvertFrom("#00FF66"));
+
+                // 🌟 LÓGICA DE ACTIVACIÓN: Reorganizar la cola manteniendo la canción actual como ancla
+                if (colaDeReproduccion != null && colaDeReproduccion.Count > 0 && indiceEnColaActual >= 0 && indiceEnColaActual < colaDeReproduccion.Count)
+                {
+                    string cancionActual = colaDeReproduccion[indiceEnColaActual];
+
+                    // CORRECCIÓN: Evitamos el conflicto de tipos evaluando de forma segura
+                    List<string> listaBase;
+                    if (rutasArchivosReales != null && rutasArchivosReales.Count > 0)
+                    {
+                        listaBase = new List<string>(rutasArchivosReales);
+                    }
+                    else
+                    {
+                        listaBase = new List<string>(colaDeReproduccion);
+                    }
+
+                    // Quitamos temporalmente la canción actual para que no se repita al azar en la mezcla
+                    listaBase.Remove(cancionActual);
+
+                    // Barajamos el resto de las canciones (Algoritmo Fisher-Yates)
+                    var rnd = new Random();
+                    int n = listaBase.Count;
+                    while (n > 1)
+                    {
+                        n--;
+                        int k = rnd.Next(n + 1);
+                        string value = listaBase[k];
+                        listaBase[k] = listaBase[n];
+                        listaBase[n] = value;
+                    }
+
+                    // Insertamos la canción actual estrictamente al inicio de la nueva mezcla aleatoria
+                    listaBase.Insert(0, cancionActual);
+
+                    // Actualizamos la ObservableCollection de la cola sin romper el enlace visual
+                    colaDeReproduccion.Clear();
+                    foreach (var ruta in listaBase)
+                    {
+                        colaDeReproduccion.Add(ruta);
+                    }
+
+                    // Fijamos el índice actual en 0 (la canción que suena pasa a ser el inicio de este ciclo aleatorio)
+                    indiceEnColaActual = 0;
+                }
             }
             else
             {
                 BtnAleatorio.Content = "🔀 SHUFFLE [OFF]";
                 BtnAleatorio.Foreground = Brushes.White;
                 BtnAleatorio.BorderBrush = Brushes.White;
+
+                // 🌟 LÓGICA DE DESACTIVACIÓN: Volver al orden original sin perdernos de la canción actual
+                if (colaDeReproduccion != null && colaDeReproduccion.Count > 0 && indiceEnColaActual >= 0 && indiceEnColaActual < colaDeReproduccion.Count)
+                {
+                    string cancionActual = colaDeReproduccion[indiceEnColaActual];
+
+                    if (rutasArchivosReales != null && rutasArchivosReales.Contains(cancionActual))
+                    {
+                        int indexOriginal = rutasArchivosReales.IndexOf(cancionActual);
+
+                        // Restauramos la cola al orden original del disco/carpeta
+                        colaDeReproduccion.Clear();
+                        foreach (var ruta in rutasArchivosReales)
+                        {
+                            colaDeReproduccion.Add(ruta);
+                        }
+
+                        // Posicionamos el índice exactamente donde le corresponde en el orden original
+                        indiceEnColaActual = indexOriginal;
+                    }
+                }
             }
+
+            // Limpiamos el historial de navegación al alternar el modo aleatorio para evitar conflictos de índices
+            historialAtras.Clear();
+            historialAdelante.Clear();
         }
 
         // BOTÓN REPETICIÓN (3 Estados rotativos: OFF -> ONE -> ALL -> OFF)
@@ -764,23 +963,41 @@ namespace CyberPlayer
                     BtnRepetir.Content = "🔁 REPEAT [ALL]";
                     BtnRepetir.Foreground = new SolidColorBrush((Color)convertidor.ConvertFrom("#00FF66"));
                     BtnRepetir.BorderBrush = new SolidColorBrush((Color)convertidor.ConvertFrom("#00FF66"));
+                    BtnRepetir.BorderBrush = new SolidColorBrush((Color)convertidor.ConvertFrom("#00FF66"));
                     break;
             }
         }
-        // Se ejecuta cada medio segundo de fondo
         private void RelojTiempo_Tick(object sender, EventArgs e)
         {
-            // Si la canción está sonando y el usuario NO está haciendo clic sobre la barra...
-            if (audioFile != null && !SliderProgreso.IsMouseOver)
+            // 1. Si la variable ya es null de entrada, apagamos el reloj
+            if (audioFile == null)
             {
-                // El reloj actualiza la barra libremente
-                SliderProgreso.Value = audioFile.CurrentTime.TotalSeconds;
-                TxtTiempoActual.Text = audioFile.CurrentTime.ToString(@"mm\:ss");
+                relojTiempo.Stop();
+                return;
+            }
+
+            try
+            {
+                if (!SliderProgreso.IsMouseOver)
+                {
+                    // 2. Usamos el operador '?' para protegernos. 
+                    // Si NAudio destruye el objeto internamente en este milisegundo, 'tiempo' será null en vez de crashear.
+                    var tiempo = audioFile?.CurrentTime;
+
+                    if (tiempo.HasValue)
+                    {
+                        SliderProgreso.Value = tiempo.Value.TotalSeconds;
+                        TxtTiempoActual.Text = tiempo.Value.ToString(@"mm\:ss");
+                    }
+                }
+            }
+            catch
+            {
+                // Absorción total en el cierre
+                relojTiempo.Stop();
             }
         }
 
-        // Se ejecuta APENAS el usuario hace clic en la barra de tiempo
-        // Se ejecuta apenas pones el dedo en la barra
         // Se ejecuta apenas tocas o haces clic en la barra
         private void SliderProgreso_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
@@ -791,7 +1008,6 @@ namespace CyberPlayer
                 bool interactuandoConTeclado = SliderProgreso.IsFocused;
 
                 // 2. Verificamos si el usuario hizo clic directo o arrastró el Slider con el mouse.
-                // Comprobamos que el mouse esté presionado Y que el puntero esté físicamente sobre el Slider.
                 bool interactuandoConMouse = SliderProgreso.IsMouseOver && System.Windows.Input.Mouse.LeftButton == System.Windows.Input.MouseButtonState.Pressed;
 
                 if (interactuandoConMouse || interactuandoConTeclado)
@@ -825,7 +1041,6 @@ namespace CyberPlayer
             }
         }
         // Se ejecuta constantemente en milisegundos mientras la música avanza
-        // Se ejecuta constantemente en milisegundos mientras la música avanza
         private void CanalMuestras_PreVolumeMeter(object sender, StreamVolumeEventArgs e)
         {
             // Usamos el Dispatcher para mover las barras de la interfaz gráfica desde el hilo de audio
@@ -850,7 +1065,7 @@ namespace CyberPlayer
                 Rectangle[] barras = { Barra0, Barra1, Barra2, Barra3, Barra4, Barra5, Barra6, Barra7 };
                 Rectangle[] picos = { Pico0, Pico1, Pico2, Pico3, Pico4, Pico5, Pico6, Pico7 };
 
-                // Multiplicadores rítmicos que ya tenías para cada una de las 8 frecuencias
+                // Multiplicadores rítmicos para cada una de las 8 frecuencias
                 double[] multiplicadores = { 1.2, 0.9, 1.1, 0.7, 0.8, 0.6, 1.0, 0.5 };
 
                 const double altoMaximo = 60.0; // Altura máxima física del visualizador (definida en el XAML)
@@ -882,22 +1097,19 @@ namespace CyberPlayer
                     // Aplicamos la altura calculada a la barra
                     barras[i].Height = nuevaAltura;
 
-                    // 3. Lógica física de gravedad para los Picos Flotantes (Picos flotando en el aire)
+                    // 3. Lógica física de gravedad para los Picos Flotantes
                     double picoActual = picosAlturas[i];
 
                     if (nuevaAltura >= picoActual)
                     {
-                        // Si la barra sube y golpea el pico, lo empuja hacia arriba inmediatamente
                         picoActual = nuevaAltura;
-                        picosVelocidadCaida[i] = -0.5; // Pequeño impulso inicial de frenado para que flote antes de caer
+                        picosVelocidadCaida[i] = -0.5; // Pequeño impulso inicial de frenado
                     }
                     else
                     {
-                        // Si la barra bajó, el pico cae por efecto de la gravedad acumulada
                         picosVelocidadCaida[i] += gravedad;
                         picoActual -= picosVelocidadCaida[i];
 
-                        // Evitamos que el pico caiga por debajo de la altura de su propia barra de sonido
                         if (picoActual < nuevaAltura)
                         {
                             picoActual = nuevaAltura;
@@ -910,7 +1122,7 @@ namespace CyberPlayer
                     // Movemos visualmente el pico horizontal usando su margen inferior
                     picos[i].Margin = new Thickness(0, 0, 0, picoActual);
 
-                    // El color del pico siempre será el rosa neón de máxima alerta para que resalte en el aire
+                    // El color del pico siempre será el rosa neón de máxima alerta
                     picos[i].Fill = colorAlto;
                 }
             });
@@ -924,14 +1136,10 @@ namespace CyberPlayer
         }
         private void BtnVolver_Click(object sender, RoutedEventArgs e)
         {
-            // Si estamos en la vista global de Todas (0), Artistas (1) o Álbumes (2), 
-            // no hay nada hacia atrás a donde ir.
             if (vistaActual == 0 || vistaActual == 1 || vistaActual == 2) return;
 
             if (vistaActual == 3)
             {
-                // ➔ Estábamos viendo los discos de un artista específico (3).
-                // Al volver, regresamos a la lista global de ARTISTAS (1).
                 vistaActual = 1;
                 ActualizarColoresPestañas(BtnVistaArtistas);
 
@@ -945,13 +1153,8 @@ namespace CyberPlayer
             }
             else if (vistaActual == 4)
             {
-                // ➔ Estábamos viendo las canciones de un disco específico (4).
-                // Aquí hay dos variantes: ¿entramos a este disco desde la pestaña Álbumes globales, 
-                // o desde adentro de un artista específico?
-
                 if (artistaFiltradoActual != null)
                 {
-                    // Variación A: Veníamos de explorar un artista. Regresamos a sus DISCOS (3).
                     vistaActual = 3;
                     ListaCanciones.Items.Clear();
                     rutasArchivosReales.Clear();
@@ -963,7 +1166,6 @@ namespace CyberPlayer
                 }
                 else
                 {
-                    // Variación B: Veníamos de la pestaña global de Álbumes. Regresamos a todos los ÁLBUMES (2).
                     vistaActual = 2;
                     ActualizarColoresPestañas(BtnVistaAlbumes);
 
@@ -980,48 +1182,67 @@ namespace CyberPlayer
         }
         private void ActualizarVisibilidadVolver()
         {
-            // Si estamos en una subvista (3 o 4), mostramos el botón. Si no, lo ocultamos.
             if (vistaActual == 3 || vistaActual == 4)
             {
                 BtnVolver.Visibility = Visibility.Visible;
             }
             else
             {
-                BtnVolver.Visibility = Visibility.Collapsed; // No ocupa espacio en la interfaz
+                BtnVolver.Visibility = Visibility.Collapsed;
             }
         }
         private void BtnEditarMetadatos_Click(object sender, RoutedEventArgs e)
         {
-            // 1. Validar selección
-            if (colaDeReproduccion == null || colaDeReproduccion.Count == 0 || indiceEnColaActual < 0 || indiceEnColaActual >= colaDeReproduccion.Count)
+            if (ListaCanciones.SelectedIndex < 0)
             {
-                MessageBox.Show("Por favor, selecciona o reproduce una canción antes de intentar editar sus metadatos.", "Ninguna canción seleccionada", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("Por favor, selecciona una canción de la lista antes de intentar editar sus metadatos.", "Ninguna canción seleccionada", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
-            // 2. Obtener la ruta del archivo ORIGINAL
-            string archivoEditar = colaDeReproduccion[indiceEnColaActual];
+            int indexVisual = ListaCanciones.SelectedIndex;
+            string archivoEditar = "";
 
-            // 3. Validar existencia
-            if (!System.IO.File.Exists(archivoEditar))
+            if (vistaActual == 0 || vistaActual == 4)
             {
-                MessageBox.Show("El archivo de audio no se encuentra disponible físicamente.", "Archivo no encontrado", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (rutasArchivosReales != null && indexVisual < rutasArchivosReales.Count)
+                {
+                    archivoEditar = rutasArchivosReales[indexVisual];
+                }
+            }
+
+            if (string.IsNullOrEmpty(archivoEditar) && indiceEnColaActual >= 0 && indiceEnColaActual < colaDeReproduccion.Count)
+            {
+                archivoEditar = colaDeReproduccion[indiceEnColaActual];
+            }
+
+            if (!string.IsNullOrEmpty(archivoEditar) && (archivoEditar.Contains(">") || archivoEditar.Contains(" - ")))
+            {
+                if (rutasArchivosReales != null && indexVisual < rutasArchivosReales.Count)
+                {
+                    archivoEditar = rutasArchivosReales[indexVisual];
+                }
+            }
+
+            if (string.IsNullOrEmpty(archivoEditar) || !System.IO.File.Exists(archivoEditar))
+            {
+                MessageBox.Show("El archivo de audio no se encuentra disponible físicamente o la vista actual no permite edición.", "Archivo no encontrado", MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
-            // 4. Abrimos el editor directamente (¡SIN DETENER LA MÚSICA!)
+            // ESCUDO 1: Apagamos el monitor de carpetas temporalmente.
+            // Evita que el FileSystemWatcher y el Editor peleen por leer/escribir el mismo archivo.
+            if (monitorCarpetas != null) monitorCarpetas.EnableRaisingEvents = false;
+
             EditorMetadatos editor = new EditorMetadatos(archivoEditar);
             editor.Owner = this;
 
-            // 5. Si el usuario guarda cambios
             if (editor.ShowDialog() == true)
             {
-                MessageBox.Show("¡Metadatos actualizados en el archivo original!", "Información", MessageBoxButton.OK, MessageBoxImage.Information);
-
-                // Opcional: Aquí puedes actualizar los textos de la interfaz (título, artista) 
-                // si los jalas de los metadatos del archivo original.
-                // ActualizarUIConMetadatos(archivoEditar);
+                RefrescarElementoModificado(archivoEditar);
             }
+
+            // Volvemos a encender el radar una vez que el archivo fue guardado y cerrado con seguridad.
+            if (monitorCarpetas != null) monitorCarpetas.EnableRaisingEvents = true;
 
             e.Handled = true;
         }
@@ -1032,6 +1253,202 @@ namespace CyberPlayer
 
             EliminarArchivoTemporal();
             base.OnClosed(e);
+        }
+        private void ActivarMonitoreoCarpeta(string rutaCarpeta)
+        {
+            if (monitorCarpetas != null)
+            {
+                monitorCarpetas.EnableRaisingEvents = false;
+                monitorCarpetas.Dispose();
+            }
+
+            monitorCarpetas = new System.IO.FileSystemWatcher();
+            monitorCarpetas.Path = rutaCarpeta;
+            monitorCarpetas.Filter = "*.mp3";
+            monitorCarpetas.IncludeSubdirectories = true;
+            monitorCarpetas.NotifyFilter = System.IO.NotifyFilters.FileName | System.IO.NotifyFilters.LastWrite;
+
+            monitorCarpetas.Changed += MonitorCarpetas_Changed;
+            monitorCarpetas.Renamed += MonitorCarpetas_Renamed;
+
+            monitorCarpetas.EnableRaisingEvents = true;
+        }
+
+        private void MonitorCarpetas_Changed(object sender, System.IO.FileSystemEventArgs e)
+        {
+            string rutaArchivoModificado = e.FullPath;
+
+            // ESCUDO 2: Retraso asíncrono.
+            // Cuando programas externos modifican un MP3, el sistema operativo retiene el archivo una fracción de segundo.
+            // Darle medio segundo asegura que TagLib no se estrelle intentando leer un archivo que aún se está escribiendo.
+            System.Threading.Tasks.Task.Delay(500).ContinueWith(_ =>
+            {
+                RefrescarElementoModificado(rutaArchivoModificado);
+            });
+        }
+
+        private void MonitorCarpetas_Renamed(object sender, System.IO.RenamedEventArgs e)
+        {
+            string rutaVieja = e.OldFullPath;
+            string rutaNueva = e.FullPath;
+
+            this.Dispatcher.Invoke(() =>
+            {
+                if (rutasArchivosReales != null && rutasArchivosReales.Contains(rutaVieja))
+                {
+                    int index = rutasArchivosReales.IndexOf(rutaVieja);
+                    rutasArchivosReales[index] = rutaNueva;
+                }
+
+                if (colaDeReproduccion != null && colaDeReproduccion.Contains(rutaVieja))
+                {
+                    int indexCola = colaDeReproduccion.IndexOf(rutaVieja);
+                    colaDeReproduccion[indexCola] = rutaNueva;
+                }
+
+                RefrescarElementoModificado(rutaNueva);
+            });
+        }
+
+        private void RefrescarElementoModificado(string rutaArchivo)
+        {
+            this.Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(rutaArchivo)) return;
+
+                    // ESCUDO 3: Encontrar el índice REAL en la lista, NO el que el usuario tiene clickeado.
+                    // Esto evita corromper la interfaz si editas una canción en Windows mientras reproduces otra en la app.
+                    int indexReal = -1;
+                    if (rutasArchivosReales != null && rutasArchivosReales.Contains(rutaArchivo))
+                    {
+                        indexReal = rutasArchivosReales.IndexOf(rutaArchivo);
+                    }
+
+                    // 2. Leer metadatos frescos desde el disco duro
+                    using (var tagFile = TagLib.File.Create(rutaArchivo))
+                    {
+                        string tituloNuevo = !string.IsNullOrEmpty(tagFile.Tag.Title)
+                            ? tagFile.Tag.Title
+                            : System.IO.Path.GetFileNameWithoutExtension(rutaArchivo);
+
+                        string artistaNuevo = (tagFile.Tag.Performers != null && tagFile.Tag.Performers.Length > 0)
+                            ? tagFile.Tag.Performers[0]
+                            : "Artista Desconocido";
+
+                        string albumNuevo = tagFile.Tag.Album ?? "Álbum Desconocido";
+
+                        // 3. Buscar en la cola de reproducción actual
+                        int indexInterno = -1;
+                        if (colaDeReproduccion != null && colaDeReproduccion.Contains(rutaArchivo))
+                            indexInterno = colaDeReproduccion.IndexOf(rutaArchivo);
+
+                        // 4. Si es la canción que está sonando AHORA, actualizamos los textos inferiores
+                        if (indexInterno != -1 && (indexInterno == indiceEnColaActual || indexInterno == indiceCancionActual))
+                        {
+                            TxtTituloActual.Text = tituloNuevo.ToUpper();
+                            TxtArtistaActual.Text = artistaNuevo.ToUpper();
+                        }
+
+                        // 5. ACTUALIZACIÓN DE LA GRILLA (Solo si la canción pertenece a la vista actual en pantalla)
+                        if (indexReal != -1)
+                        {
+                            string textoVisualNuevo = $"{artistaNuevo} - {albumNuevo} > {tituloNuevo}";
+
+                            if (ListaCanciones.ItemsSource != null)
+                            {
+                                if (ListaCanciones.ItemsSource is System.Collections.IList listaEnMemoria)
+                                {
+                                    if (indexReal >= 0 && indexReal < listaEnMemoria.Count)
+                                    {
+                                        listaEnMemoria[indexReal] = textoVisualNuevo;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if (indexReal >= 0 && indexReal < ListaCanciones.Items.Count)
+                                {
+                                    ListaCanciones.Items[indexReal] = textoVisualNuevo;
+                                }
+                            }
+
+                            // ESCUDO 4: Evitar el cartel de WPF (InvalidOperationException).
+                            // Solo disparamos el Refresh() nativo si NO estamos usando un Binding (ItemsSource).
+                            if (ListaCanciones.ItemsSource == null)
+                            {
+                                ListaCanciones.Items.Refresh();
+                            }
+
+                            // Ya no robamos el foco con SelectedIndex. Si el archivo se actualiza en segundo plano, 
+                            // no te interrumpirá visualmente lo que estés haciendo.
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Error controlado al refrescar grilla: {ex.Message}");
+                }
+            });
+        }
+
+        // Método de soporte discreto para validar si es la canción activa sin romper el hilo
+        private bool indexVisualValidado(string ruta)
+        {
+            try
+            {
+                return colaDeReproduccion != null &&
+                       indiceEnColaActual < colaDeReproduccion.Count &&
+                       colaDeReproduccion[indiceEnColaActual] == ruta;
+            }
+            catch { return false; }
+        }
+        private void CargarYReproducerCola(List<string> rutasOriginales, int indiceSeleccionado)
+        {
+            if (rutasOriginales == null || rutasOriginales.Count == 0 || indiceSeleccionado < 0 || indiceSeleccionado >= rutasOriginales.Count)
+                return;
+
+            colaDeReproduccion.Clear();
+
+            if (modoAleatorio)
+            {
+                // Si el aleatorio ya está activo, barajamos la lista inmediatamente 
+                // colocando la canción seleccionada como la ancla principal (índice 0).
+                string cancionElegida = rutasOriginales[indiceSeleccionado];
+                var listaBase = new List<string>(rutasOriginales);
+                listaBase.Remove(cancionElegida);
+
+                var rnd = new Random();
+                int n = listaBase.Count;
+                while (n > 1)
+                {
+                    n--;
+                    int k = rnd.Next(n + 1);
+                    string value = listaBase[k];
+                    listaBase[k] = listaBase[n];
+                    listaBase[n] = value;
+                }
+
+                listaBase.Insert(0, cancionElegida);
+
+                foreach (var ruta in listaBase)
+                {
+                    colaDeReproduccion.Add(ruta);
+                }
+                indiceEnColaActual = 0; // La canción elegida arranca al inicio del ciclo aleatorio
+            }
+            else
+            {
+                // Si está apagado, se carga en orden secuencial normal
+                foreach (var ruta in rutasOriginales)
+                {
+                    colaDeReproduccion.Add(ruta);
+                }
+                indiceEnColaActual = indiceSeleccionado;
+            }
+
+            ReproducirCancionDesdeCola();
         }
     }
 }

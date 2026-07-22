@@ -27,14 +27,16 @@ namespace CyberPlayer
         {
             try
             {
-                if (string.IsNullOrEmpty(_archivoPath) || !System.IO.File.Exists(_archivoPath))
+                // 1. Validación simplificada: Solo nos aseguramos de que la ruta no esté vacía.
+                // La existencia física ya fue garantizada por la ventana principal.
+                if (string.IsNullOrEmpty(_archivoPath))
                 {
-                    MessageBox.Show("El archivo de audio no es válido o no existe.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    MessageBox.Show("La ruta del archivo no es válida.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     Close();
                     return;
                 }
 
-                // El 'using' libera el archivo de audio inmediatamente al terminar de leer etiquetas
+                // 2. El 'using' libera el archivo de audio inmediatamente al terminar de leer etiquetas
                 using (var file = TagLib.File.Create(_archivoPath))
                 {
                     // Cargar textos en los inputs de tu XAML
@@ -54,7 +56,7 @@ namespace CyberPlayer
                             var bitmap = new BitmapImage();
                             bitmap.BeginInit();
                             bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
-                            bitmap.CacheOption = BitmapCacheOption.OnLoad; // <-- ESTO ES LO CRÍTICO: Fuerza la carga en RAM
+                            bitmap.CacheOption = BitmapCacheOption.OnLoad; // Fuerza la carga en RAM
                             bitmap.StreamSource = ms;
                             bitmap.EndInit();
                             bitmap.Freeze(); // Hace la imagen inmutable y optimiza el rendimiento en WPF
@@ -71,6 +73,7 @@ namespace CyberPlayer
             catch (Exception ex)
             {
                 MessageBox.Show($"Error al cargar metadatos: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                Close(); // Si falla al leer el TagLib, cerramos para no dejar una ventana vacía
             }
         }
 
@@ -108,6 +111,7 @@ namespace CyberPlayer
         {
             try
             {
+                // Se abre y cierra el archivo de forma atómica
                 using (var file = TagLib.File.Create(_archivoPath))
                 {
                     // Guardar textos en las etiquetas
@@ -127,8 +131,11 @@ namespace CyberPlayer
                         file.Tag.Pictures = new TagLib.IPicture[] { nuevaFoto };
                     }
 
-                    file.Save();
+                    file.Save(); // Guarda y libera el handle inmediatamente
                 }
+
+                // Desvincular la fuente de la imagen de la UI antes de cerrar para liberar memoria
+                ImgCover.Source = null;
 
                 MessageBox.Show("Metadatos guardados correctamente.", "Éxito", MessageBoxButton.OK, MessageBoxImage.Information);
                 DialogResult = true;
